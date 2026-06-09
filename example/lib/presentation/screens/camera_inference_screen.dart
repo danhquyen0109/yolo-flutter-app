@@ -62,6 +62,13 @@ class _CameraInferenceScreenState extends State<CameraInferenceScreen> {
     // Show all 6 tasks (Detect / Segment / Semantic / Classify / Pose / OBB) to match the iOS app's task control.
     return Scaffold(
       body: YOLOShowcase(versionLabel: _versionLabel, onCapture: _onCapture),
+      floatingActionButton: FloatingActionButton.extended(
+        onPressed: () => Navigator.pushNamed(context, '/multi-task'),
+        backgroundColor: const Color(0xFF111827),
+        foregroundColor: Colors.white,
+        icon: const Icon(Icons.layers, size: 20),
+        label: const Text('Multi-Task', style: TextStyle(fontSize: 13)),
+      ),
     );
   }
 }
