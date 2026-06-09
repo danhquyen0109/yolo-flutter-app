@@ -97,6 +97,9 @@ class YOLOPlatformView(
         }
 
         try {
+            val multiTaskConfigs = parseMultiTaskConfigs(
+                creationParams?.get("multiTaskConfigs") as? List<*>
+            )
             // Resolve model path
             modelPath = resolveModelPath(context, modelPath)
             val task = YOLOTask.valueOf(taskString.uppercase())
@@ -124,9 +127,13 @@ class YOLOPlatformView(
                 // Callback for compatibility
             }
             
-            // Load model
-            val useGpu = creationParams?.get("useGpu") as? Boolean ?: true
-            yoloView.setModel(modelPath, task, useGpu)
+            // Load model(s)
+            if (multiTaskConfigs.isNotEmpty()) {
+                yoloView.setMultiTaskModels(multiTaskConfigs)
+            } else {
+                val useGpu = creationParams?.get("useGpu") as? Boolean ?: true
+                yoloView.setModel(modelPath, task, useGpu)
+            }
             
         } catch (e: Exception) {
             Log.e(TAG, "Error initializing YOLOPlatformView", e)
@@ -386,6 +393,21 @@ class YOLOPlatformView(
                         }
                     }
                 }
+                "setMultiTaskModels" -> {
+                    val tasksRaw = call.argument<List<*>>("tasks")
+                    val configs = parseMultiTaskConfigs(tasksRaw)
+                    if (configs.isEmpty()) {
+                        result.error("invalid_args", "tasks is required and must not be empty", null)
+                        return
+                    }
+                    yoloView.setMultiTaskModels(configs) { success ->
+                        if (success) {
+                            result.success(null)
+                        } else {
+                            result.error("MODEL_NOT_FOUND", "Failed to load one or more multi-task models", null)
+                        }
+                    }
+                }
                 "switchCamera" -> {
                     yoloView.switchCamera()
                     result.success(null)
@@ -558,5 +580,59 @@ class YOLOPlatformView(
             }
             else -> modelPath
         }
+    }
+
+    private fun parseStreamConfig(configMap: Map<*, *>?): YOLOStreamConfig? {
+        if (configMap == null) return null
+        return YOLOStreamConfig(
+            includeDetections = configMap["includeDetections"] as? Boolean ?: true,
+            includeClassifications = configMap["includeClassifications"] as? Boolean ?: true,
+            includeProcessingTimeMs = configMap["includeProcessingTimeMs"] as? Boolean ?: true,
+            includeFps = configMap["includeFps"] as? Boolean ?: true,
+            includeMasks = configMap["includeMasks"] as? Boolean ?: false,
+            includePoses = configMap["includePoses"] as? Boolean ?: false,
+            includeOBB = configMap["includeOBB"] as? Boolean ?: false,
+            includeOriginalImage = configMap["includeOriginalImage"] as? Boolean ?: false,
+            maxFPS = (configMap["maxFPS"] as? Number)?.toInt(),
+            throttleIntervalMs = (configMap["throttleIntervalMs"] as? Number)?.toInt(),
+            inferenceFrequency = (configMap["inferenceFrequency"] as? Number)?.toInt(),
+            skipFrames = (configMap["skipFrames"] as? Number)?.toInt()
+        )
+    }
+
+    private fun parseMultiTaskConfigs(rawConfigs: List<*>?): List<MultiTaskModelConfig> {
+        if (rawConfigs == null || rawConfigs.isEmpty()) return emptyList()
+        val parsed = mutableListOf<MultiTaskModelConfig>()
+        for ((index, entry) in rawConfigs.withIndex()) {
+            val map = entry as? Map<*, *> ?: continue
+            val modelPathRaw = map["modelPath"] as? String ?: continue
+            val taskRaw = map["task"] as? String ?: continue
+            val task = try {
+                YOLOTask.valueOf(taskRaw.uppercase())
+            } catch (_: IllegalArgumentException) {
+                continue
+            }
+            val resolvedModelPath = resolveModelPath(context, modelPathRaw)
+            val taskKey = map["taskKey"] as? String ?: "task_$index"
+            val useGpu = map["useGpu"] as? Boolean ?: true
+            val confidenceThreshold = (map["confidenceThreshold"] as? Number)?.toDouble()
+            val iouThreshold = (map["iouThreshold"] as? Number)?.toDouble()
+            val numItemsThreshold = (map["numItemsThreshold"] as? Number)?.toInt()
+            val perTaskStream = parseStreamConfig(map["streamingConfig"] as? Map<*, *>)
+
+            parsed.add(
+                MultiTaskModelConfig(
+                    taskKey = taskKey,
+                    modelPath = resolvedModelPath,
+                    task = task,
+                    useGpu = useGpu,
+                    confidenceThreshold = confidenceThreshold,
+                    iouThreshold = iouThreshold,
+                    numItemsThreshold = numItemsThreshold,
+                    streamingConfig = perTaskStream,
+                )
+            )
+        }
+        return parsed
     }
 }

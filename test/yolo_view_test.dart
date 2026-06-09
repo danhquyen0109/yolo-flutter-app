@@ -3,6 +3,7 @@
 import 'package:flutter/services.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:flutter/material.dart';
+import 'package:ultralytics_yolo/models/yolo_multi_task.dart';
 import 'package:ultralytics_yolo/yolo_view.dart';
 import 'package:ultralytics_yolo/widgets/yolo_controller.dart';
 import 'package:ultralytics_yolo/models/yolo_task.dart';
@@ -146,6 +147,18 @@ void main() {
             cameraResolution: '1080p',
             onResult: (results) {},
             onPerformanceMetrics: (metrics) {},
+          ),
+        ),
+      );
+      expect(find.byType(YOLOView), findsOneWidget);
+
+      await tester.pumpWidget(
+        const MaterialApp(
+          home: YOLOView(
+            multiTaskConfigs: [
+              YOLOMultiTaskConfig(modelPath: 'det_model.tflite', task: YOLOTask.detect),
+              YOLOMultiTaskConfig(modelPath: 'seg_model.tflite', task: YOLOTask.segment),
+            ],
           ),
         ),
       );

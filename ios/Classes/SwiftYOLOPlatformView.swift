@@ -14,6 +14,27 @@ extension Float {
   }
 }
 
+private func parseMultiTaskConfigs(_ rawConfigs: Any?) -> [YOLOMultiTaskModelConfig] {
+  guard let rawConfigs = rawConfigs as? [[String: Any]] else { return [] }
+  return rawConfigs.enumerated().compactMap { index, config in
+    guard let modelPath = config["modelPath"] as? String,
+      let taskRaw = config["task"] as? String
+    else {
+      return nil
+    }
+    return YOLOMultiTaskModelConfig(
+      taskKey: config["taskKey"] as? String ?? "task_\(index)",
+      modelPath: modelPath,
+      task: YOLOTask.fromString(taskRaw),
+      useGpu: config["useGpu"] as? Bool ?? true,
+      confidenceThreshold: config["confidenceThreshold"] as? Double,
+      iouThreshold: config["iouThreshold"] as? Double,
+      numItemsThreshold: config["numItemsThreshold"] as? Int,
+      streamingConfig: (config["streamingConfig"] as? [String: Any]).map(YOLOStreamConfig.from(dict:))
+    )
+  }
+}
+
 // See YOLOPlugin.swift — `@preconcurrency` on the conformances keeps the (non-isolated) FlutterPlatformView /
 // FlutterStreamHandler protocols from tripping Swift 6 strict-isolation warnings on this `@MainActor` class.
 @MainActor
@@ -77,6 +98,7 @@ public final class SwiftYOLOPlatformView: NSObject,
       let taskRaw = dict["task"] as? String
     {
       let task = YOLOTask.fromString(taskRaw)
+      let multiTaskConfigs = parseMultiTaskConfigs(dict["multiTaskConfigs"])
 
       // Get new threshold parameters
       let confidenceThreshold = dict["confidenceThreshold"] as? Double ?? 0.25
@@ -111,6 +133,17 @@ public final class SwiftYOLOPlatformView: NSObject,
 
       // Setup method channel handler
       setupMethodChannel()
+
+      if !multiTaskConfigs.isEmpty {
+        yoloView?.setMultiTaskModels(multiTaskConfigs) { modelResult in
+          switch modelResult {
+          case .success:
+            break
+          case .failure(let error):
+            NSLog("SwiftYOLOPlatformView: Failed to load multi-task configs: %@", error.localizedDescription)
+          }
+        }
+      }
 
       // Setup zoom callback — keep the legacy method-channel invocation for existing consumers and also push a typed
       // event on the event channel so the new Dart-side ZoomIndicator (PR 3) can subscribe.
@@ -399,6 +432,36 @@ public final class SwiftYOLOPlatformView: NSObject,
           result(
             FlutterError(
               code: "invalid_args", message: "Invalid arguments for setModel", details: nil))
+        }
+
+      case "setMultiTaskModels":
+        if let args = call.arguments as? [String: Any] {
+          let configs = parseMultiTaskConfigs(args["tasks"])
+          guard !configs.isEmpty else {
+            result(
+              FlutterError(
+                code: "invalid_args", message: "Invalid arguments for setMultiTaskModels",
+                details: nil))
+            return
+          }
+          self.yoloView?.setMultiTaskModels(configs) { modelResult in
+            switch modelResult {
+            case .success:
+              result(nil)
+            case .failure(let error):
+              result(
+                FlutterError(
+                  code: "MODEL_NOT_FOUND",
+                  message: "Failed to load one or more multi-task models - \(error.localizedDescription)",
+                  details: nil
+                ))
+            }
+          }
+        } else {
+          result(
+            FlutterError(
+              code: "invalid_args", message: "Invalid arguments for setMultiTaskModels",
+              details: nil))
         }
 
       case "captureFrame":

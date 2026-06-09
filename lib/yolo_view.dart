@@ -1,10 +1,11 @@
 // Ultralytics 🚀 AGPL-3.0 License - https://ultralytics.com/license
 
 import 'dart:async';
-import 'package:flutter/foundation.dart' show defaultTargetPlatform;
+import 'package:flutter/foundation.dart' show defaultTargetPlatform, listEquals;
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:ultralytics_yolo/core/yolo_model_resolver.dart';
+import 'package:ultralytics_yolo/models/yolo_multi_task.dart';
 import 'package:ultralytics_yolo/utils/logger.dart';
 import 'package:ultralytics_yolo/models/yolo_result.dart';
 import 'package:ultralytics_yolo/models/yolo_task.dart';
@@ -27,14 +28,13 @@ enum LensFacing {
 class YOLOView extends StatefulWidget {
   final String modelPath;
   final YOLOTask? task;
+  final List<YOLOMultiTaskConfig>? multiTaskConfigs;
   final YOLOViewController? controller;
   final String cameraResolution;
   final Function(List<YOLOResult>)? onResult;
+  final Function(List<YOLOMultiTaskResult>)? onMultiTaskResult;
   final Function(YOLOPerformanceMetrics)? onPerformanceMetrics;
-
-  /// Raw per-frame streaming data. Top-level keys include `detections`, `fps`, `processingTimeMs`,
-  /// `timestamp`, `frameNumber`, and `imageWidth`/`imageHeight` — the dimensions of the upright frame
-  /// that normalized detection coordinates refer to, for custom overlay transforms.
+  final Function(List<YOLOPerformanceMetrics>)? onMultiTaskPerformanceMetrics;
   final Function(Map<String, dynamic>)? onStreamingData;
   final Function(double zoomLevel)? onZoomChanged;
 
@@ -57,12 +57,15 @@ class YOLOView extends StatefulWidget {
 
   const YOLOView({
     super.key,
-    required this.modelPath,
+    this.modelPath = 'yolo26n',
     this.task,
+    this.multiTaskConfigs,
     this.controller,
     this.cameraResolution = '720p',
     this.onResult,
+    this.onMultiTaskResult,
     this.onPerformanceMetrics,
+    this.onMultiTaskPerformanceMetrics,
     this.onStreamingData,
     this.onZoomChanged,
     this.onModelError,
@@ -85,6 +88,7 @@ class _YOLOViewState extends State<YOLOView> {
   late EventChannel _resultEventChannel;
   StreamSubscription<dynamic>? _resultSubscription;
   YOLOResolvedModel? _resolvedModel;
+  List<_ResolvedMultiTaskConfig>? _resolvedMultiTaskConfigs;
   Object? _resolutionError;
   int _resolutionRequestId = 0;
 
@@ -98,9 +102,18 @@ class _YOLOViewState extends State<YOLOView> {
   // intent independently of `_resolvedModel`, which is committed only after a switch succeeds and therefore lags an
   // in-flight switch. Used to decide whether a native switch is actually needed and to dedupe redundant reloads.
   YOLOResolvedModel? _nativeSwitchTarget;
+  String? _nativeMultiSwitchSignature;
 
   final String _viewId = UniqueKey().toString();
   int? _platformViewId;
+
+    bool get _isMultiTaskMode =>
+      widget.multiTaskConfigs != null && widget.multiTaskConfigs!.isNotEmpty;
+
+    bool get _hasResolvedModel =>
+      _isMultiTaskMode
+        ? _resolvedMultiTaskConfigs != null && _resolvedMultiTaskConfigs!.isNotEmpty
+        : _resolvedModel != null;
 
   @override
   void initState() {
@@ -167,8 +180,36 @@ class _YOLOViewState extends State<YOLOView> {
         logInfo('YOLOView: Error processing streaming data: $e');
       }
     } else {
-      _handleDetectionResults(event);
-      _handlePerformanceMetrics(event);
+      final multiTaskResults = _parseMultiTaskResults(event);
+      if (multiTaskResults.isNotEmpty) {
+        _handleMultiTaskResults(multiTaskResults);
+      } else {
+        _handleDetectionResults(event);
+        _handlePerformanceMetrics(event);
+      }
+    }
+  }
+
+  void _handleMultiTaskResults(List<YOLOMultiTaskResult> results) {
+    if (widget.onMultiTaskResult != null) {
+      widget.onMultiTaskResult!(results);
+    }
+
+    final metrics = results
+        .map((result) => result.performance)
+        .whereType<YOLOPerformanceMetrics>()
+        .toList(growable: false);
+    if (widget.onMultiTaskPerformanceMetrics != null && metrics.isNotEmpty) {
+      widget.onMultiTaskPerformanceMetrics!(metrics);
+    }
+
+    // Backward compatibility for single-task callbacks: mirror the first task frame.
+    final first = results.first;
+    if (widget.onResult != null) {
+      widget.onResult!(first.detections);
+    }
+    if (widget.onPerformanceMetrics != null && first.performance != null) {
+      widget.onPerformanceMetrics!(first.performance!);
     }
   }
 
@@ -195,6 +236,46 @@ class _YOLOViewState extends State<YOLOView> {
     }
   }
 
+  List<YOLOMultiTaskResult> _parseMultiTaskResults(
+    Map<dynamic, dynamic> event,
+  ) {
+    final results = <YOLOMultiTaskResult>[];
+
+    final listPayload = event['multiTaskResults'];
+    if (listPayload is List) {
+      for (var i = 0; i < listPayload.length; i++) {
+        final item = listPayload[i];
+        if (item is! Map) continue;
+        try {
+          final key = (item['taskKey'] as String?) ??
+              (item['task'] as String?) ??
+              'task_$i';
+          results.add(YOLOMultiTaskResult.fromMap(key, item));
+        } catch (e) {
+          logInfo('YOLOView: Error parsing multi-task entry: $e');
+        }
+      }
+      if (results.isNotEmpty) return results;
+    }
+
+    final mapPayload = event['resultsByTask'] ?? event['taskResults'];
+    if (mapPayload is Map) {
+      for (final entry in mapPayload.entries) {
+        final value = entry.value;
+        if (value is! Map) continue;
+        try {
+          results.add(
+            YOLOMultiTaskResult.fromMap(entry.key.toString(), value),
+          );
+        } catch (e) {
+          logInfo('YOLOView: Error parsing multi-task map entry: $e');
+        }
+      }
+    }
+
+    return results;
+  }
+
   List<YOLOResult> _parseDetectionResults(Map<dynamic, dynamic> event) {
     final detectionsData = event['detections'] as List<dynamic>? ?? const [];
     final results = <YOLOResult>[];
@@ -218,7 +299,14 @@ class _YOLOViewState extends State<YOLOView> {
 
   Future<void> _resolveModel({bool switchExisting = false}) async {
     final requestId = ++_resolutionRequestId;
-    await _performModelResolution(
+    if (_isMultiTaskMode) {
+      await _performMultiTaskResolution(
+        requestId: requestId,
+        switchExisting: switchExisting,
+      );
+      return;
+    }
+    await _performSingleTaskResolution(
       requestId: requestId,
       switchExisting: switchExisting,
       modelPath: widget.modelPath,
@@ -226,7 +314,7 @@ class _YOLOViewState extends State<YOLOView> {
     );
   }
 
-  Future<void> _performModelResolution({
+  Future<void> _performSingleTaskResolution({
     required int requestId,
     required bool switchExisting,
     required String modelPath,
@@ -309,10 +397,130 @@ class _YOLOViewState extends State<YOLOView> {
         setState(() {
           _resolutionError = error;
           _resolvedModel = null;
+          _resolvedMultiTaskConfigs = null;
         });
         widget.onModelError?.call(error, modelPath, task);
       }
     }
+  }
+
+  Future<void> _performMultiTaskResolution({
+    required int requestId,
+    required bool switchExisting,
+  }) async {
+    final configs = widget.multiTaskConfigs ?? const <YOLOMultiTaskConfig>[];
+    if (configs.isEmpty) {
+      setState(() {
+        _resolutionError = StateError(
+          'multiTaskConfigs must not be empty when multi-task mode is enabled.',
+        );
+        _resolvedModel = null;
+        _resolvedMultiTaskConfigs = null;
+      });
+      return;
+    }
+
+    if (mounted) {
+      setState(() {
+        _resolutionError = null;
+      });
+    }
+
+    try {
+      final resolvedConfigs = <_ResolvedMultiTaskConfig>[];
+      for (final config in configs) {
+        final resolvedModel = await YOLOModelResolver.resolve(
+          modelPath: config.modelPath,
+          task: config.task,
+        );
+        resolvedConfigs.add(
+          _ResolvedMultiTaskConfig(
+            source: config,
+            resolvedModel: resolvedModel,
+          ),
+        );
+      }
+
+      if (!mounted || requestId != _resolutionRequestId) return;
+
+      if (switchExisting && _platformViewId != null) {
+        final nextSignature = _multiTaskSignature(resolvedConfigs);
+        final pending = _nativeSwitchChain.then((_) async {
+          if (!mounted || requestId != _resolutionRequestId) return;
+          if (_nativeMultiSwitchSignature != nextSignature) {
+            final previousSignature = _nativeMultiSwitchSignature;
+            _nativeMultiSwitchSignature = nextSignature;
+            try {
+              await _effectiveController.setMultiTaskModels(
+                resolvedConfigs.map((entry) => entry.source).toList(
+                  growable: false,
+                ),
+              );
+            } catch (_) {
+              _nativeMultiSwitchSignature = previousSignature;
+              rethrow;
+            }
+          }
+          if (!mounted || requestId != _resolutionRequestId) return;
+          setState(() {
+            _resolvedMultiTaskConfigs = resolvedConfigs;
+            _resolvedModel = resolvedConfigs.first.resolvedModel;
+          });
+          for (final entry in resolvedConfigs) {
+            widget.onModelLoad?.call(
+              entry.resolvedModel.modelPath,
+              entry.resolvedModel.task,
+            );
+          }
+        });
+        _nativeSwitchChain = pending.catchError((_) {});
+        await pending;
+      } else {
+        setState(() {
+          _resolvedMultiTaskConfigs = resolvedConfigs;
+          _resolvedModel = resolvedConfigs.first.resolvedModel;
+        });
+        _nativeMultiSwitchSignature = _multiTaskSignature(resolvedConfigs);
+        for (final entry in resolvedConfigs) {
+          widget.onModelLoad?.call(
+            entry.resolvedModel.modelPath,
+            entry.resolvedModel.task,
+          );
+        }
+      }
+    } catch (error) {
+      if (!mounted || requestId != _resolutionRequestId) return;
+      if (switchExisting && _resolvedMultiTaskConfigs != null) {
+        FlutterError.reportError(
+          FlutterErrorDetails(
+            exception: error,
+            library: 'ultralytics_yolo',
+            context: ErrorDescription('switching multi-task model set'),
+          ),
+        );
+        final first = _resolvedMultiTaskConfigs!.first.resolvedModel;
+        widget.onModelError?.call(error, first.modelPath, first.task);
+      } else {
+        logInfo('YOLOView: Failed to load multi-task configs: $error');
+        setState(() {
+          _resolutionError = error;
+          _resolvedModel = null;
+          _resolvedMultiTaskConfigs = null;
+        });
+        widget.onModelError?.call(error, configs.first.modelPath, configs.first.task);
+      }
+    }
+  }
+
+  String _multiTaskSignature(List<_ResolvedMultiTaskConfig> configs) {
+    return configs
+        .map(
+          (entry) =>
+              '${entry.resolvedModel.modelPath}|${entry.resolvedModel.task.name}|'
+              '${entry.source.useGpu}|${entry.source.confidenceThreshold}|'
+              '${entry.source.iouThreshold}|${entry.source.numItemsThreshold}',
+        )
+        .join('::');
   }
 
   @override
@@ -332,8 +540,12 @@ class _YOLOViewState extends State<YOLOView> {
     // Handle callback changes
     final callbacksChanged =
         (oldWidget.onResult == null) != (widget.onResult == null) ||
+      (oldWidget.onMultiTaskResult == null) !=
+        (widget.onMultiTaskResult == null) ||
         (oldWidget.onPerformanceMetrics == null) !=
             (widget.onPerformanceMetrics == null) ||
+      (oldWidget.onMultiTaskPerformanceMetrics == null) !=
+        (widget.onMultiTaskPerformanceMetrics == null) ||
         (oldWidget.onStreamingData == null) != (widget.onStreamingData == null);
 
     if (callbacksChanged) {
@@ -344,9 +556,36 @@ class _YOLOViewState extends State<YOLOView> {
 
     // Handle model or task changes
     if (oldWidget.modelPath != widget.modelPath ||
-        oldWidget.task != widget.task) {
+        oldWidget.task != widget.task ||
+        _multiTaskConfigChanged(oldWidget.multiTaskConfigs, widget.multiTaskConfigs)) {
       _resolveModel(switchExisting: _platformViewId != null);
     }
+  }
+
+  bool _multiTaskConfigChanged(
+    List<YOLOMultiTaskConfig>? previous,
+    List<YOLOMultiTaskConfig>? next,
+  ) {
+    if (previous == null && next == null) return false;
+    if (previous == null || next == null) return true;
+    if (previous.length != next.length) return true;
+
+    final previousSig = previous
+        .map(
+          (entry) =>
+              '${entry.modelPath}|${entry.task?.name}|${entry.useGpu}|'
+              '${entry.confidenceThreshold}|${entry.iouThreshold}|${entry.numItemsThreshold}',
+        )
+        .toList(growable: false);
+    final nextSig = next
+        .map(
+          (entry) =>
+              '${entry.modelPath}|${entry.task?.name}|${entry.useGpu}|'
+              '${entry.confidenceThreshold}|${entry.iouThreshold}|${entry.numItemsThreshold}',
+        )
+        .toList(growable: false);
+
+    return !listEquals(previousSig, nextSig);
   }
 
   @override
@@ -389,7 +628,7 @@ class _YOLOViewState extends State<YOLOView> {
         ),
       );
     }
-    if (_resolvedModel == null) {
+    if (!_hasResolvedModel) {
       // Match the in-app model-loading veil so the first load and subsequent switches look consistent.
       return const ColoredBox(
         color: Colors.black,
@@ -460,6 +699,17 @@ class _YOLOViewState extends State<YOLOView> {
       'useGpu': widget.useGpu,
       'lensFacing': widget.lensFacing.name,
     };
+
+    if (_isMultiTaskMode && _resolvedMultiTaskConfigs != null) {
+      creationParams['multiTaskConfigs'] = _resolvedMultiTaskConfigs!
+          .map((entry) => entry.toCreationParams(
+                defaultConfidenceThreshold: widget.confidenceThreshold,
+                defaultIouThreshold: widget.iouThreshold,
+                defaultNumItemsThreshold: _effectiveController.numItemsThreshold,
+                inheritedStreamingConfig: widget.streamingConfig,
+              ))
+          .toList(growable: false);
+    }
 
     if (widget.streamingConfig != null) {
       final streamConfig = <String, dynamic>{
@@ -549,4 +799,50 @@ class _YOLOViewState extends State<YOLOView> {
       _effectiveController.setZoomLevel(zoomLevel);
   Future<void> setShowOverlays(bool visible) =>
       _effectiveController.setShowOverlays(visible);
+}
+
+class _ResolvedMultiTaskConfig {
+  const _ResolvedMultiTaskConfig({
+    required this.source,
+    required this.resolvedModel,
+  });
+
+  final YOLOMultiTaskConfig source;
+  final YOLOResolvedModel resolvedModel;
+
+  Map<String, dynamic> toCreationParams({
+    required double defaultConfidenceThreshold,
+    required double defaultIouThreshold,
+    required int defaultNumItemsThreshold,
+    YOLOStreamingConfig? inheritedStreamingConfig,
+  }) {
+    final map = <String, dynamic>{
+      'modelPath': resolvedModel.modelPath,
+      'task': resolvedModel.task.name,
+      'useGpu': source.useGpu,
+      'confidenceThreshold':
+          source.confidenceThreshold ?? defaultConfidenceThreshold,
+      'iouThreshold': source.iouThreshold ?? defaultIouThreshold,
+      'numItemsThreshold': source.numItemsThreshold ?? defaultNumItemsThreshold,
+    };
+
+    final streamConfig = source.streamingConfig ?? inheritedStreamingConfig;
+    if (streamConfig != null) {
+      map['streamingConfig'] = {
+        'includeDetections': streamConfig.includeDetections,
+        'includeClassifications': streamConfig.includeClassifications,
+        'includeProcessingTimeMs': streamConfig.includeProcessingTimeMs,
+        'includeFps': streamConfig.includeFps,
+        'includeMasks': streamConfig.includeMasks,
+        'includePoses': streamConfig.includePoses,
+        'includeOBB': streamConfig.includeOBB,
+        'includeOriginalImage': streamConfig.includeOriginalImage,
+        'maxFPS': streamConfig.maxFPS,
+        'throttleIntervalMs': streamConfig.throttleInterval?.inMilliseconds,
+        'inferenceFrequency': streamConfig.inferenceFrequency,
+        'skipFrames': streamConfig.skipFrames,
+      };
+    }
+    return map;
+  }
 }

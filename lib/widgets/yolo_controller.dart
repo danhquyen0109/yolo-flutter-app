@@ -4,6 +4,7 @@ import 'dart:async';
 
 import 'package:flutter/services.dart';
 import 'package:ultralytics_yolo/core/yolo_model_resolver.dart';
+import 'package:ultralytics_yolo/models/yolo_multi_task.dart';
 import 'package:ultralytics_yolo/models/yolo_task.dart';
 import 'package:ultralytics_yolo/utils/logger.dart';
 import 'package:ultralytics_yolo/yolo_streaming_config.dart';
@@ -205,6 +206,85 @@ class YOLOViewController {
       });
     } catch (e) {
       logInfo('YOLOViewController.setModel failed: $e');
+      rethrow;
+    }
+  }
+
+  /// Resolves and activates multiple model/task entries for a multi-task camera pipeline.
+  ///
+  /// Native implementations that do not yet support this method can ignore it and continue running
+  /// the primary model configured by `setModel`/creation params.
+  Future<void> setMultiTaskModels(List<YOLOMultiTaskConfig> configs) async {
+    final channel = _methodChannel;
+    if (channel == null || _viewId == null || configs.isEmpty) return;
+
+    final resolvedConfigs = <Map<String, dynamic>>[];
+    for (final config in configs) {
+      final resolvedModel = await YOLOModelResolver.resolve(
+        modelPath: config.modelPath,
+        task: config.task,
+      );
+      final resolvedMap = <String, dynamic>{
+        'modelPath': resolvedModel.modelPath,
+        'task': resolvedModel.task.name,
+        'useGpu': config.useGpu,
+      };
+      if (config.confidenceThreshold != null) {
+        resolvedMap['confidenceThreshold'] = config.confidenceThreshold;
+      }
+      if (config.iouThreshold != null) {
+        resolvedMap['iouThreshold'] = config.iouThreshold;
+      }
+      if (config.numItemsThreshold != null) {
+        resolvedMap['numItemsThreshold'] = config.numItemsThreshold;
+      }
+      if (config.streamingConfig != null) {
+        resolvedMap['streamingConfig'] = {
+          'includeDetections': config.streamingConfig!.includeDetections,
+          'includeClassifications':
+              config.streamingConfig!.includeClassifications,
+          'includeProcessingTimeMs':
+              config.streamingConfig!.includeProcessingTimeMs,
+          'includeFps': config.streamingConfig!.includeFps,
+          'includeMasks': config.streamingConfig!.includeMasks,
+          'includePoses': config.streamingConfig!.includePoses,
+          'includeOBB': config.streamingConfig!.includeOBB,
+          'includeOriginalImage': config.streamingConfig!.includeOriginalImage,
+          'maxFPS': config.streamingConfig!.maxFPS,
+          'throttleIntervalMs':
+              config.streamingConfig!.throttleInterval?.inMilliseconds,
+          'inferenceFrequency': config.streamingConfig!.inferenceFrequency,
+          'skipFrames': config.streamingConfig!.skipFrames,
+        };
+      }
+      resolvedConfigs.add(resolvedMap);
+    }
+
+    try {
+      await channel.invokeMethod<void>('setMultiTaskModels', {
+        'tasks': resolvedConfigs,
+      });
+    } on MissingPluginException {
+      // Backward compatibility for older native binaries: run at least the primary entry.
+      final first = resolvedConfigs.first;
+      await channel.invokeMethod<void>('setModel', {
+        'modelPath': first['modelPath'],
+        'task': first['task'],
+      });
+    } on PlatformException catch (e) {
+      final unsupported = e.code.toLowerCase() == 'unimplemented' ||
+          e.code.toLowerCase() == 'not_implemented';
+      if (!unsupported) {
+        logInfo('YOLOViewController.setMultiTaskModels failed: $e');
+        rethrow;
+      }
+      final first = resolvedConfigs.first;
+      await channel.invokeMethod<void>('setModel', {
+        'modelPath': first['modelPath'],
+        'task': first['task'],
+      });
+    } catch (e) {
+      logInfo('YOLOViewController.setMultiTaskModels failed: $e');
       rethrow;
     }
   }

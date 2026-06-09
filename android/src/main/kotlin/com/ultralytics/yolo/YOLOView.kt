@@ -48,6 +48,24 @@ data class LensInfo(
     val cameraInfo: CameraInfo? = null
 )
 
+data class MultiTaskModelConfig(
+    val taskKey: String,
+    val modelPath: String,
+    val task: YOLOTask,
+    val useGpu: Boolean = true,
+    val confidenceThreshold: Double? = null,
+    val iouThreshold: Double? = null,
+    val numItemsThreshold: Int? = null,
+    val streamingConfig: YOLOStreamConfig? = null,
+)
+
+private data class TaskSchedulerState(
+    var lastInferenceTimeNs: Long = Long.MIN_VALUE,
+    var frameSkipCount: Int = 0,
+    var targetSkipFrames: Int = 0,
+    var inferenceFrameIntervalNs: Long? = null,
+)
+
 class YOLOView @JvmOverloads constructor(
     context: Context,
     attrs: AttributeSet? = null
@@ -164,6 +182,7 @@ class YOLOView @JvmOverloads constructor(
     
     // Throttling variables for performance control
     private var lastInferenceTime: Long = 0
+    private var lastStreamDispatchTime: Long = 0
     private var targetFrameInterval: Long? = null // in nanoseconds
     private var throttleInterval: Long? = null // in nanoseconds
     
@@ -180,6 +199,11 @@ class YOLOView @JvmOverloads constructor(
     /** Set streaming configuration */
     fun setStreamConfig(config: YOLOStreamConfig?) {
         this.streamConfig = config
+        val includeMasks = config?.includeMasks == true
+        (predictor as? BasePredictor)?.includeRawMaskData = includeMasks
+        for (predictorForTask in multiTaskPredictors.values) {
+            (predictorForTask as? BasePredictor)?.includeRawMaskData = includeMasks
+        }
         setupThrottlingFromConfig()
     }
 
@@ -227,6 +251,12 @@ class YOLOView @JvmOverloads constructor(
     private var predictor: Predictor? = null
     private var task: YOLOTask = YOLOTask.DETECT
     private var modelName: String = "Model"
+    private var multiTaskEnabled: Boolean = false
+    private val multiTaskPredictors = linkedMapOf<String, Predictor>()
+    private val multiTaskConfigsByKey = linkedMapOf<String, MultiTaskModelConfig>()
+    private val taskSchedulerStates = linkedMapOf<String, TaskSchedulerState>()
+    private val lastResultsByTask = linkedMapOf<String, YOLOResult>()
+    private var primaryTaskKey: String? = null
 
     // Camera config
     private var lensFacing = CameraSelector.LENS_FACING_BACK
@@ -386,6 +416,11 @@ class YOLOView @JvmOverloads constructor(
     fun setConfidenceThreshold(conf: Double) {
         confidenceThreshold = conf
         predictor?.setConfidenceThreshold(conf)
+        if (multiTaskEnabled) {
+            for (predictorForTask in multiTaskPredictors.values) {
+                predictorForTask.setConfidenceThreshold(conf)
+            }
+        }
         // Update the confidence label if UI controls are shown
         if (showUIControls) {
             post {
@@ -397,11 +432,21 @@ class YOLOView @JvmOverloads constructor(
     fun setIouThreshold(iou: Double) {
         iouThreshold = iou
         predictor?.setIouThreshold(iou)
+        if (multiTaskEnabled) {
+            for (predictorForTask in multiTaskPredictors.values) {
+                predictorForTask.setIouThreshold(iou)
+            }
+        }
     }
 
     fun setNumItemsThreshold(n: Int) {
         numItemsThreshold = n
         predictor?.setNumItemsThreshold(n)
+        if (multiTaskEnabled) {
+            for (predictorForTask in multiTaskPredictors.values) {
+                predictorForTask.setNumItemsThreshold(n)
+            }
+        }
     }
     
     fun setShowOverlays(show: Boolean) {
@@ -550,7 +595,39 @@ class YOLOView @JvmOverloads constructor(
         }
     }
 
+    private fun createPredictorForTask(modelPath: String, task: YOLOTask, useGpu: Boolean): Predictor {
+        return when (task) {
+            YOLOTask.DETECT -> ObjectDetector(context = context, modelPath = modelPath, labels = emptyList(), useGpu = useGpu)
+            YOLOTask.SEGMENT -> Segmenter(context, modelPath, labels = emptyList(), useGpu = useGpu)
+            YOLOTask.SEMANTIC -> SemanticSegmenter(context, modelPath, labels = emptyList(), useGpu = useGpu)
+            YOLOTask.CLASSIFY -> Classifier(context, modelPath, labels = emptyList(), useGpu = useGpu)
+            YOLOTask.POSE -> PoseEstimator(context, modelPath, labels = emptyList(), useGpu = useGpu)
+            YOLOTask.OBB -> ObbDetector(context, modelPath, labels = emptyList(), useGpu = useGpu)
+        }
+    }
+
+    private fun applyThresholdsToPredictor(
+        predictor: Predictor,
+        confidence: Double,
+        iou: Double,
+        numItems: Int,
+        includeMasks: Boolean
+    ) {
+        predictor.setConfidenceThreshold(confidence)
+        predictor.setIouThreshold(iou)
+        predictor.setNumItemsThreshold(numItems)
+        (predictor as? BasePredictor)?.let { base ->
+            base.includeRawMaskData = includeMasks
+        }
+    }
+
     fun setModel(modelPath: String, task: YOLOTask, useGpu: Boolean = true, callback: ((Boolean) -> Unit)? = null) {
+        multiTaskEnabled = false
+        multiTaskPredictors.clear()
+        multiTaskConfigsByKey.clear()
+        taskSchedulerStates.clear()
+        lastResultsByTask.clear()
+        primaryTaskKey = null
         val cacheKey = "$modelPath|$task|$useGpu"
         inferenceResult = null
         post {
@@ -559,9 +636,13 @@ class YOLOView @JvmOverloads constructor(
 
         // Fast path: reuse an already-loaded predictor (re-applying the current thresholds) for an instant switch.
         predictorCache[cacheKey]?.let { cached ->
-            cached.setConfidenceThreshold(confidenceThreshold)
-            cached.setIouThreshold(iouThreshold)
-            cached.setNumItemsThreshold(numItemsThreshold)
+            applyThresholdsToPredictor(
+                cached,
+                confidenceThreshold,
+                iouThreshold,
+                numItemsThreshold,
+                streamConfig?.includeMasks == true
+            )
             post {
                 this.task = task
                 this.predictor = cached
@@ -578,21 +659,14 @@ class YOLOView @JvmOverloads constructor(
 
         Executors.newSingleThreadExecutor().execute {
             try {
-                val newPredictor = when (task) {
-                    YOLOTask.DETECT -> ObjectDetector(context = context, modelPath = modelPath, labels = emptyList(), useGpu = useGpu)
-                    YOLOTask.SEGMENT -> Segmenter(context, modelPath, labels = emptyList(), useGpu = useGpu)
-                    YOLOTask.SEMANTIC -> SemanticSegmenter(context, modelPath, labels = emptyList(), useGpu = useGpu)
-                    YOLOTask.CLASSIFY -> Classifier(context, modelPath, labels = emptyList(), useGpu = useGpu)
-                    YOLOTask.POSE -> PoseEstimator(context, modelPath, labels = emptyList(), useGpu = useGpu)
-                    YOLOTask.OBB -> ObbDetector(context, modelPath, labels = emptyList(), useGpu = useGpu)
-                }
-
-                // Apply thresholds to all predictor types
-                newPredictor.apply {
-                    setConfidenceThreshold(confidenceThreshold)
-                    setIouThreshold(iouThreshold)
-                    setNumItemsThreshold(numItemsThreshold)
-                }
+                val newPredictor = createPredictorForTask(modelPath, task, useGpu)
+                applyThresholdsToPredictor(
+                    newPredictor,
+                    confidenceThreshold,
+                    iouThreshold,
+                    numItemsThreshold,
+                    streamConfig?.includeMasks == true
+                )
 
                 post {
                     this.task = task
@@ -618,6 +692,88 @@ class YOLOView @JvmOverloads constructor(
                     }
                     modelLoadCallback?.invoke(false)
                     callback?.invoke(false)
+                }
+            }
+        }
+    }
+
+    fun setMultiTaskModels(
+        configs: List<MultiTaskModelConfig>,
+        callback: ((Boolean) -> Unit)? = null
+    ) {
+        if (configs.isEmpty()) {
+            callback?.invoke(false)
+            return
+        }
+
+        inferenceResult = null
+        post {
+            overlayView.invalidate()
+        }
+
+        Executors.newSingleThreadExecutor().execute {
+            try {
+                val loadedPredictors = linkedMapOf<String, Predictor>()
+
+                for (config in configs) {
+                    val cacheKey = "${config.modelPath}|${config.task}|${config.useGpu}"
+                    val cached = predictorCache[cacheKey]
+                    val predictorForTask = cached ?: createPredictorForTask(
+                        config.modelPath,
+                        config.task,
+                        config.useGpu
+                    )
+
+                    val perTaskStream = config.streamingConfig
+                    val includeMasks = perTaskStream?.includeMasks ?: (streamConfig?.includeMasks == true)
+                    applyThresholdsToPredictor(
+                        predictorForTask,
+                        config.confidenceThreshold ?: confidenceThreshold,
+                        config.iouThreshold ?: iouThreshold,
+                        config.numItemsThreshold ?: numItemsThreshold,
+                        includeMasks
+                    )
+
+                    loadedPredictors[config.taskKey] = predictorForTask
+                }
+
+                post {
+                    multiTaskEnabled = true
+                    multiTaskPredictors.clear()
+                    multiTaskPredictors.putAll(loadedPredictors)
+
+                    multiTaskConfigsByKey.clear()
+                    configs.forEach { config ->
+                        multiTaskConfigsByKey[config.taskKey] = config
+                    }
+
+                    taskSchedulerStates.clear()
+                    lastResultsByTask.clear()
+
+                    val primaryConfig = configs.first()
+                    primaryTaskKey = primaryConfig.taskKey
+                    this.task = primaryConfig.task
+                    this.predictor = loadedPredictors[primaryConfig.taskKey]
+                    this.modelName = primaryConfig.modelPath.substringAfterLast("/")
+
+                    for (config in configs) {
+                        val key = "${config.modelPath}|${config.task}|${config.useGpu}"
+                        loadedPredictors[config.taskKey]?.let { predictorForTask ->
+                            cachePredictor(key, predictorForTask)
+                        }
+                    }
+
+                    modelLoadCallback?.invoke(true)
+                    callback?.invoke(true)
+                    if (allPermissionsGranted() && lifecycleOwner != null && (camera == null || isStopped)) {
+                        startCamera()
+                    }
+                }
+            } catch (e: Exception) {
+                Log.w(TAG, "Failed to set multi-task model pipeline", e)
+                post {
+                    callback?.invoke(false)
+                    modelLoadCallback?.invoke(false)
                 }
             }
         }
@@ -1445,40 +1601,62 @@ class YOLOView @JvmOverloads constructor(
             return
         }
 
-        predictor?.let { p ->
-            // Double-check stopped flag before inference (predictor might be closed)
-            if (isStopped) {
+        val activePredictors: Map<String, Predictor> = if (multiTaskEnabled && multiTaskPredictors.isNotEmpty()) {
+            LinkedHashMap(multiTaskPredictors)
+        } else {
+            val single = predictor
+            if (single == null) {
                 imageProxy.close()
                 return
             }
+            linkedMapOf("primary" to single)
+        }
 
-            // Check if we should run inference on this frame
-            if (!shouldRunInference()) {
-                imageProxy.close()
-                return
-            }
-            
-            try {
-                syncTargetRotation()
-                // Get device orientation
-                val orientation = context.resources.configuration.orientation
-                val isLandscape = orientation == Configuration.ORIENTATION_LANDSCAPE
-                
-                // Check if using front camera
-                val isFrontCamera = lensFacing == CameraSelector.LENS_FACING_FRONT
-                val rotationDegrees = imageProxy.imageInfo.rotationDegrees
-                val isRotated = rotationDegrees % 180 != 0
-                val orientedWidth = if (isRotated) h else w
-                val orientedHeight = if (isRotated) w else h
-                
-                // Set camera facing information in predictor
-                (p as? BasePredictor)?.let { basePredictor ->
+        // Double-check stopped flag before inference (predictor might be closed)
+        if (isStopped) {
+            imageProxy.close()
+            return
+        }
+
+        // Check if we should run inference on this frame
+        if (!multiTaskEnabled && !shouldRunInference()) {
+            imageProxy.close()
+            return
+        }
+
+        try {
+            syncTargetRotation()
+            // Get device orientation
+            val orientation = context.resources.configuration.orientation
+            val isLandscape = orientation == Configuration.ORIENTATION_LANDSCAPE
+
+            // Check if using front camera
+            val isFrontCamera = lensFacing == CameraSelector.LENS_FACING_FRONT
+            val rotationDegrees = imageProxy.imageInfo.rotationDegrees
+            val isRotated = rotationDegrees % 180 != 0
+            val orientedWidth = if (isRotated) h else w
+            val orientedHeight = if (isRotated) w else h
+
+            var anyTaskRan = false
+            var primaryRan = false
+            for ((taskKey, predictorForTask) in activePredictors) {
+                val perTaskConfig = if (multiTaskEnabled) {
+                    multiTaskConfigsByKey[taskKey]?.streamingConfig ?: streamConfig ?: YOLOStreamConfig.DEFAULT
+                } else {
+                    streamConfig ?: YOLOStreamConfig.DEFAULT
+                }
+
+                if (multiTaskEnabled && !shouldRunInferenceForTask(taskKey, perTaskConfig)) {
+                    continue
+                }
+
+                (predictorForTask as? BasePredictor)?.let { basePredictor ->
                     basePredictor.isFrontCamera = isFrontCamera
                     basePredictor.cameraRotationDegrees = rotationDegrees
-                    basePredictor.includeRawMaskData = streamConfig?.includeMasks == true
+                    basePredictor.includeRawMaskData = perTaskConfig.includeMasks
                 }
-                
-                val result = p.predict(
+
+                val taskResult = predictorForTask.predict(
                     bitmap,
                     orientedWidth,
                     orientedHeight,
@@ -1486,46 +1664,99 @@ class YOLOView @JvmOverloads constructor(
                     isLandscape = isLandscape
                 )
 
-                // Apply originalImage if streaming config requires it
-                val resultWithOriginalImage = if (streamConfig?.includeOriginalImage == true) {
-                    result.copy(originalImage = bitmap)  // Reuse bitmap from ImageProxy conversion
+                val resultWithOriginalImage = if (perTaskConfig.includeOriginalImage) {
+                    taskResult.copy(originalImage = bitmap)
                 } else {
-                    result
+                    taskResult
                 }
-                
-                inferenceResult = resultWithOriginalImage
-
-                // Log
-                
-                // Callback
-                inferenceCallback?.invoke(resultWithOriginalImage)
-                
-                // Streaming callback (with output throttling)
-                streamCallback?.let { callback ->
-                    if (shouldProcessFrame()) {
-                        updateLastInferenceTime()
-                        
-                        // Convert to stream data and send
-                        val streamData = convertResultToStreamData(resultWithOriginalImage)
-                        // Add timestamp and frame info
-                        val enhancedStreamData = HashMap<String, Any>(streamData)
-                        enhancedStreamData["timestamp"] = System.currentTimeMillis()
-                        enhancedStreamData["frameNumber"] = frameNumberCounter++
-                        // Dimensions of the upright frame that (normalized) detection coordinates refer to (#506)
-                        enhancedStreamData["imageWidth"] = resultWithOriginalImage.origShape.width
-                        enhancedStreamData["imageHeight"] = resultWithOriginalImage.origShape.height
-                        
-                        callback.invoke(enhancedStreamData)
-                    }
+                lastResultsByTask[taskKey] = resultWithOriginalImage
+                anyTaskRan = true
+                if (!multiTaskEnabled || taskKey == primaryTaskKey) {
+                    primaryRan = true
                 }
-
-                // Update overlay
-                post {
-                    overlayView.invalidate()
-                }
-            } catch (e: Exception) {
-                Log.e(TAG, "Error during prediction", e)
             }
+
+            if (!anyTaskRan) {
+                imageProxy.close()
+                return
+            }
+
+            val resultsByTask = linkedMapOf<String, YOLOResult>()
+            if (multiTaskEnabled) {
+                resultsByTask.putAll(lastResultsByTask)
+            } else {
+                lastResultsByTask["primary"]?.let { resultsByTask["primary"] = it }
+            }
+
+            val primaryKey = if (multiTaskEnabled) {
+                primaryTaskKey ?: resultsByTask.keys.firstOrNull()
+            } else {
+                "primary"
+            }
+            val primaryResult = primaryKey?.let { resultsByTask[it] } ?: resultsByTask.values.firstOrNull()
+            if (!multiTaskEnabled) {
+                updateLastInferenceTime()
+            }
+            if (primaryResult != null && (!multiTaskEnabled || primaryRan)) {
+                inferenceResult = primaryResult
+                inferenceCallback?.invoke(primaryResult)
+            }
+
+            // Streaming callback (with output throttling)
+            streamCallback?.let { callback ->
+                if (shouldProcessFrame()) {
+                    updateLastStreamDispatchTime()
+
+                    val enhancedStreamData = HashMap<String, Any>()
+                    if (multiTaskEnabled) {
+                        val taskPayload = linkedMapOf<String, Any>()
+                        for ((taskKey, resultForTask) in resultsByTask) {
+                            val config = multiTaskConfigsByKey[taskKey]
+                            val perTaskConfig = config?.streamingConfig ?: streamConfig ?: YOLOStreamConfig.DEFAULT
+                            val taskStreamData = HashMap<String, Any>(
+                                convertResultToStreamData(resultForTask, perTaskConfig)
+                            )
+                            taskStreamData["task"] = (config?.task ?: task).name.lowercase()
+                            taskStreamData["modelPath"] = config?.modelPath
+                            taskPayload[taskKey] = taskStreamData
+                        }
+                        enhancedStreamData["resultsByTask"] = taskPayload
+
+                        // Keep legacy top-level payload from the primary task for backward compatibility.
+                        if (primaryResult != null) {
+                            val primaryConfig = primaryKey?.let { multiTaskConfigsByKey[it] }
+                            val primaryStreamConfig = primaryConfig?.streamingConfig ?: streamConfig ?: YOLOStreamConfig.DEFAULT
+                            enhancedStreamData.putAll(convertResultToStreamData(primaryResult, primaryStreamConfig))
+                        }
+                    } else {
+                        val singleResult = primaryResult
+                        if (singleResult != null) {
+                            enhancedStreamData.putAll(
+                                convertResultToStreamData(
+                                    singleResult,
+                                    streamConfig ?: YOLOStreamConfig.DEFAULT
+                                )
+                            )
+                        }
+                    }
+
+                    enhancedStreamData["timestamp"] = System.currentTimeMillis()
+                    enhancedStreamData["frameNumber"] = frameNumberCounter++
+                    primaryResult?.let {
+                        enhancedStreamData["imageWidth"] = it.origShape.width
+                        enhancedStreamData["imageHeight"] = it.origShape.height
+                    }
+
+                    callback.invoke(enhancedStreamData)
+                }
+            }
+
+            // Update overlay
+            post {
+                overlayView.invalidate()
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "Error during prediction", e)
         }
         imageProxy.close()
     }
@@ -1943,7 +2174,41 @@ class YOLOView @JvmOverloads constructor(
 
             // Initialize timing
             lastInferenceTime = System.nanoTime()
+            lastStreamDispatchTime = System.nanoTime()
         }
+    }
+
+    private fun schedulerStateFor(taskKey: String, config: YOLOStreamConfig): TaskSchedulerState {
+        val state = taskSchedulerStates.getOrPut(taskKey) { TaskSchedulerState() }
+        state.targetSkipFrames = config.skipFrames?.takeIf { it > 0 } ?: 0
+        state.inferenceFrameIntervalNs = config.inferenceFrequency
+            ?.takeIf { it > 0 }
+            ?.let { 1_000_000_000L / it }
+        return state
+    }
+
+    private fun shouldRunInferenceForTask(taskKey: String, config: YOLOStreamConfig): Boolean {
+        val state = schedulerStateFor(taskKey, config)
+        val now = System.nanoTime()
+
+        if (state.targetSkipFrames > 0) {
+            state.frameSkipCount += 1
+            if (state.frameSkipCount <= state.targetSkipFrames) {
+                return false
+            }
+            state.frameSkipCount = 0
+            state.lastInferenceTimeNs = now
+            return true
+        }
+
+        state.inferenceFrameIntervalNs?.let { interval ->
+            if (state.lastInferenceTimeNs != Long.MIN_VALUE && now - state.lastInferenceTimeNs < interval) {
+                return false
+            }
+        }
+
+        state.lastInferenceTimeNs = now
+        return true
     }
     
     /**
@@ -1983,14 +2248,14 @@ class YOLOView @JvmOverloads constructor(
         
         // Check maxFPS throttling
         targetFrameInterval?.let { interval ->
-            if (now - lastInferenceTime < interval) {
+            if (now - lastStreamDispatchTime < interval) {
                 return false
             }
         }
         
         // Check throttleInterval
         throttleInterval?.let { interval ->
-            if (now - lastInferenceTime < interval) {
+            if (now - lastStreamDispatchTime < interval) {
                 return false
             }
         }
@@ -2003,6 +2268,10 @@ class YOLOView @JvmOverloads constructor(
      */
     private fun updateLastInferenceTime() {
         lastInferenceTime = System.nanoTime()
+    }
+
+    private fun updateLastStreamDispatchTime() {
+        lastStreamDispatchTime = System.nanoTime()
     }
     
     /**
@@ -2027,9 +2296,12 @@ class YOLOView @JvmOverloads constructor(
      * Convert YOLOResult to a Map for streaming (ported from archived YOLOPlatformView)
      * Uses detection index correctly to avoid class index confusion
      */
-    private fun convertResultToStreamData(result: YOLOResult): Map<String, Any> {
+    private fun convertResultToStreamData(
+        result: YOLOResult,
+        configOverride: YOLOStreamConfig? = null
+    ): Map<String, Any> {
         val map = HashMap<String, Any>()
-        val config = streamConfig ?: return emptyMap()
+        val config = configOverride ?: streamConfig ?: YOLOStreamConfig.DEFAULT
         
         // Convert detection results (if enabled)
         if (config.includeDetections) {
@@ -2434,6 +2706,12 @@ class YOLOView @JvmOverloads constructor(
             predictorCache.clear()
             predictorCacheOrder.clear()
             predictor = null
+            multiTaskEnabled = false
+            multiTaskPredictors.clear()
+            multiTaskConfigsByKey.clear()
+            taskSchedulerStates.clear()
+            lastResultsByTask.clear()
+            primaryTaskKey = null
             inferenceCallback = null
             streamCallback = null
             inferenceResult = null

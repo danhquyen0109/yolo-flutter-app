@@ -20,7 +20,8 @@ import UltralyticsYOLO
 /// Protocol for receiving video capture frame processing results.
 @MainActor
 protocol VideoCaptureDelegate: AnyObject {
-  func onPredict(result: YOLOResult)
+  func shouldRunPrimaryInference() -> Bool
+  func onPredict(result: YOLOResult, sampleBuffer: CMSampleBuffer)
   func onInferenceTime(speed: Double, fps: Double)
 }
 
@@ -67,6 +68,7 @@ class VideoCapture: NSObject, @unchecked Sendable {
   var frameSizeCaptured = false
 
   private var currentBuffer: CVPixelBuffer?
+  private var currentSampleBuffer: CMSampleBuffer?
 
   // Called with the very next sample buffer rendered through the video output; matches upstream YOLO iOS
   // `captureNextFrame`. Used by `capturePhoto` so the share-sheet image is a freshly composited live frame (not a
@@ -266,7 +268,11 @@ class VideoCapture: NSObject, @unchecked Sendable {
       !predictor.isUpdating,
       let pixelBuffer = CMSampleBufferGetImageBuffer(sampleBuffer)
     else { return }
+    if delegate?.shouldRunPrimaryInference() == false {
+      return
+    }
     currentBuffer = pixelBuffer
+    currentSampleBuffer = sampleBuffer
     self.predictor?.isUpdating = true
     if !frameSizeCaptured {
       let frameWidth = CGFloat(CVPixelBufferGetWidth(pixelBuffer))
@@ -377,7 +383,9 @@ extension VideoCapture: ResultsListener, InferenceTimeListener {
   func on(result: YOLOResult) {
     DispatchQueue.main.async {
       defer { self.predictor?.isUpdating = false }
-      self.delegate?.onPredict(result: result)
+      guard let sampleBuffer = self.currentSampleBuffer else { return }
+      self.delegate?.onPredict(result: result, sampleBuffer: sampleBuffer)
+      self.currentSampleBuffer = nil
     }
   }
 }

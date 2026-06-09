@@ -17,6 +17,46 @@ import UIKit
 import UltralyticsYOLO
 import Vision
 
+struct YOLOMultiTaskModelConfig {
+  let taskKey: String
+  let modelPath: String
+  let task: YOLOTask
+  let useGpu: Bool
+  let confidenceThreshold: Double?
+  let iouThreshold: Double?
+  let numItemsThreshold: Int?
+  let streamingConfig: YOLOStreamConfig?
+}
+
+private struct TaskSchedulerState {
+  var lastInferenceTime: TimeInterval = -.greatestFiniteMagnitude
+  var frameSkipCount: Int = 0
+  var targetSkipFrames: Int = 0
+  var inferenceFrameInterval: TimeInterval? = nil
+}
+
+private final class PredictionCollector: ResultsListener, InferenceTimeListener {
+  private let semaphore = DispatchSemaphore(value: 0)
+  private(set) var result: YOLOResult?
+  private(set) var speed: Double = 0
+  private(set) var fps: Double = 0
+
+  func on(result: YOLOResult) {
+    self.result = result
+    semaphore.signal()
+  }
+
+  func on(inferenceTime: Double, fpsRate: Double) {
+    speed = inferenceTime
+    fps = fpsRate
+  }
+
+  func wait(timeout: TimeInterval = 1.0) -> YOLOResult? {
+    _ = semaphore.wait(timeout: .now() + timeout)
+    return result
+  }
+}
+
 /// Maps a rect normalized to `imageSize` into on-screen view coordinates under an aspect-fill (`resizeAspectFill`)
 /// preview: scale the image by `max(viewW/imgW, viewH/imgH)`, center it, and crop. Inverts exactly what the camera
 /// preview layer does, so overlays line up with the live image regardless of camera/preview aspect ratio. Ported from
@@ -44,6 +84,16 @@ func aspectFillDisplayRect(for normalizedRect: CGRect, imageSize: CGSize, viewSi
 /// A UIView component that provides real-time object detection, segmentation, and pose estimation capabilities.
 @MainActor
 public class YOLOView: UIView, VideoCaptureDelegate {
+  func shouldRunPrimaryInference() -> Bool {
+    if isMultiTaskEnabled, let primaryTaskKey {
+      let config = multiTaskConfigsByKey[primaryTaskKey]?.streamingConfig
+        ?? streamConfig
+        ?? YOLOStreamConfig.DEFAULT
+      return shouldRunInference(for: primaryTaskKey, config: config)
+    }
+    return shouldRunInference()
+  }
+
   func onInferenceTime(speed: Double, fps: Double) {
     // Store performance data for streaming
     self.currentFps = fps
@@ -56,34 +106,93 @@ public class YOLOView: UIView, VideoCaptureDelegate {
     }
   }
 
-  func onPredict(result: YOLOResult) {
-
-    // Check if we should process inference result based on frequency control
-    if !shouldRunInference() {
+  func onPredict(result: YOLOResult, sampleBuffer: CMSampleBuffer) {
+    if isMultiTaskEnabled, !multiTaskPredictors.isEmpty {
+      handleMultiTaskPrediction(primaryResult: result, sampleBuffer: sampleBuffer)
       return
     }
 
-    task == .obb ? showOBBs(predictions: result) : showBoxes(predictions: result)
-    onDetection?(result)
+    finalizePrediction(primaryResult: result, resultsByTask: nil)
+  }
 
-    // Streaming callback (with output throttling)
-    if let streamCallback = onStream {
-      if shouldProcessFrame() {
-        updateLastInferenceTime()
+  private func handleMultiTaskPrediction(
+    primaryResult: YOLOResult,
+    sampleBuffer: CMSampleBuffer
+  ) {
+    let predictors = multiTaskPredictors
+    let configs = multiTaskConfigsByKey
+    let primaryKey = primaryTaskKey
 
-        // Convert to stream data and send
-        let streamData = convertResultToStreamData(result)
-        // Add timestamp and frame info
-        var enhancedStreamData = streamData
-        enhancedStreamData["timestamp"] = Int64(Date().timeIntervalSince1970 * 1000)  // milliseconds
-        enhancedStreamData["frameNumber"] = frameNumberCounter
-        frameNumberCounter += 1
-        // Dimensions of the upright frame that (normalized) detection coordinates refer to (#506)
-        enhancedStreamData["imageWidth"] = Int(result.orig_shape.width)
-        enhancedStreamData["imageHeight"] = Int(result.orig_shape.height)
-
-        streamCallback(enhancedStreamData)
+    DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+      guard let self else { return }
+      var anySecondaryTaskRan = false
+      var resultsByTask = self.lastResultsByTask
+      if let primaryKey {
+        resultsByTask[primaryKey] = primaryResult
       }
+
+      for (taskKey, predictor) in predictors {
+        if taskKey == primaryKey { continue }
+        let config = configs[taskKey]?.streamingConfig ?? self.streamConfig ?? .DEFAULT
+        if !self.shouldRunInference(for: taskKey, config: config) {
+          continue
+        }
+        let collector = PredictionCollector()
+        predictor.predict(
+          sampleBuffer: sampleBuffer,
+          onResultsListener: collector,
+          onInferenceTime: collector
+        )
+        if let secondaryResult = collector.wait() {
+          resultsByTask[taskKey] = secondaryResult
+          anySecondaryTaskRan = true
+        }
+      }
+
+      DispatchQueue.main.async {
+        self.lastResultsByTask = resultsByTask
+        if !anySecondaryTaskRan {
+          self.lastResultsByTask[primaryKey ?? "primary"] = primaryResult
+        }
+        self.finalizePrediction(primaryResult: primaryResult, resultsByTask: resultsByTask)
+      }
+    }
+  }
+
+  private func finalizePrediction(
+    primaryResult: YOLOResult,
+    resultsByTask: [String: YOLOResult]?
+  ) {
+    if !isMultiTaskEnabled {
+      updateLastInferenceTime()
+    }
+    task == .obb ? showOBBs(predictions: primaryResult) : showBoxes(predictions: primaryResult)
+    onDetection?(primaryResult)
+
+    if let streamCallback = onStream, shouldProcessFrame() {
+      updateLastStreamDispatchTime()
+
+      var enhancedStreamData = convertResultToStreamData(primaryResult)
+      if let resultsByTask, !resultsByTask.isEmpty {
+        var payload: [String: Any] = [:]
+        for (taskKey, taskResult) in resultsByTask {
+          var taskPayload = convertResultToStreamData(
+            taskResult,
+            configOverride: multiTaskConfigsByKey[taskKey]?.streamingConfig
+          )
+          taskPayload["task"] = String(describing: multiTaskConfigsByKey[taskKey]?.task ?? task)
+            .lowercased()
+          taskPayload["modelPath"] = multiTaskConfigsByKey[taskKey]?.modelPath
+          payload[taskKey] = taskPayload
+        }
+        enhancedStreamData["resultsByTask"] = payload
+      }
+      enhancedStreamData["timestamp"] = Int64(Date().timeIntervalSince1970 * 1000)
+      enhancedStreamData["frameNumber"] = frameNumberCounter
+      frameNumberCounter += 1
+      enhancedStreamData["imageWidth"] = Int(primaryResult.orig_shape.width)
+      enhancedStreamData["imageHeight"] = Int(primaryResult.orig_shape.height)
+      streamCallback(enhancedStreamData)
     }
 
     if !_showOverlays {
@@ -93,40 +202,33 @@ public class YOLOView: UIView, VideoCaptureDelegate {
 
     if task == .segment || task == .semantic {
       let maskImage =
-        self.task == .segment ? result.masks?.combinedMask : result.semanticMask?.maskImage
+        self.task == .segment ? primaryResult.masks?.combinedMask : primaryResult.semanticMask?.maskImage
       if let maskImage {
         guard let maskLayer = self.maskLayer else { return }
-
         maskLayer.isHidden = false
-
-        // Fit the mask to the true aspect-fill image rect (from the actual frame size), not a hardcoded-ratio
-        // overlay rect, so the mask registers with the preview. Mirrors yolo-ios-app YOLOView.
-        maskLayer.frame = self.imageFrameInOverlay(for: result.orig_shape)
+        maskLayer.frame = self.imageFrameInOverlay(for: primaryResult.orig_shape)
         maskLayer.contents = maskImage
       } else {
         maskLayer?.isHidden = true
         maskLayer?.contents = nil
       }
     } else if task == .classify {
-      self.overlayYOLOClassificationsCALayer(on: self, result: result)
+      self.overlayYOLOClassificationsCALayer(on: self, result: primaryResult)
     } else if task == .pose {
       self.removeAllSubLayers(parentLayer: poseLayer)
       var keypointList = [[(x: Float, y: Float)]]()
       var confsList = [[Float]]()
 
-      for keypoint in result.keypointsList {
+      for keypoint in primaryResult.keypointsList {
         keypointList.append(keypoint.xyn)
         confsList.append(keypoint.conf)
       }
       guard let poseLayer = poseLayer else { return }
-      // Position + size the pose layer to the true aspect-fill image rect (with the crop offset baked into its
-      // origin), then draw keypoints normalized to that rect — so keypoints register with the person and share the
-      // preview's coordinate space. Mirrors yolo-ios-app YOLOView.
-      let poseFrame = imageFrameInOverlay(for: result.orig_shape)
+      let poseFrame = imageFrameInOverlay(for: primaryResult.orig_shape)
       poseLayer.frame = poseFrame
       drawKeypoints(
-        keypointsList: keypointList, confsList: confsList, boundingBoxes: result.boxes,
-        on: poseLayer, imageViewSize: poseFrame.size, originalImageSize: result.orig_shape)
+        keypointsList: keypointList, confsList: confsList, boundingBoxes: primaryResult.boxes,
+        on: poseLayer, imageViewSize: poseFrame.size, originalImageSize: primaryResult.orig_shape)
     }
   }
 
@@ -149,6 +251,7 @@ public class YOLOView: UIView, VideoCaptureDelegate {
 
   // Throttling variables for performance control
   private var lastInferenceTime: TimeInterval = 0
+  private var lastStreamDispatchTime: TimeInterval = 0
   private var targetFrameInterval: TimeInterval? = nil  // in seconds
   private var throttleInterval: TimeInterval? = nil  // in seconds
 
@@ -160,6 +263,12 @@ public class YOLOView: UIView, VideoCaptureDelegate {
   // Performance data tracking
   private var currentFps: Double = 0.0
   private var currentProcessingTime: Double = 0.0
+  private var multiTaskPredictors: [String: Predictor] = [:]
+  private var multiTaskConfigsByKey: [String: YOLOMultiTaskModelConfig] = [:]
+  private var taskSchedulerStates: [String: TaskSchedulerState] = [:]
+  private var lastResultsByTask: [String: YOLOResult] = [:]
+  private var primaryTaskKey: String?
+  private var isMultiTaskEnabled = false
 
   private var videoCapture: VideoCapture
   private var busy = false
@@ -305,22 +414,11 @@ public class YOLOView: UIView, VideoCaptureDelegate {
     }
   }
 
-  public func setModel(
-    modelPathOrName: String,
-    task: YOLOTask,
-    useGpu: Bool = true,
-    completion: ((Result<Void, Error>) -> Void)? = nil
-  ) {
-    activityIndicator.startAnimating()
-    boundingBoxViews.forEach { box in
-      box.hide()
-    }
-
+  private func resolveModelURL(for modelPathOrName: String) -> URL? {
     var modelURL: URL?
     let lowercasedPath = modelPathOrName.lowercased()
     let fileManager = FileManager.default
 
-    // Determine model URL
     if lowercasedPath.hasSuffix(".mlmodel") || lowercasedPath.hasSuffix(".mlpackage")
       || lowercasedPath.hasSuffix(".mlmodelc")
     {
@@ -330,8 +428,7 @@ public class YOLOView: UIView, VideoCaptureDelegate {
         modelURL = possibleURL
       }
     } else {
-      if let compiledURL = Bundle.main.url(forResource: modelPathOrName, withExtension: "mlmodelc")
-      {
+      if let compiledURL = Bundle.main.url(forResource: modelPathOrName, withExtension: "mlmodelc") {
         modelURL = compiledURL
       } else if let packageURL = Bundle.main.url(
         forResource: modelPathOrName, withExtension: "mlpackage")
@@ -340,27 +437,81 @@ public class YOLOView: UIView, VideoCaptureDelegate {
       }
     }
 
-    guard let unwrappedModelURL = modelURL else {
-      // Model not found - allow camera preview without inference
-      NSLog(
-        "YOLOView: Model file not found: %@. Camera will run without inference.", modelPathOrName)
-      self.videoCapture.predictor = nil
-      self.activityIndicator.stopAnimating()
-      self.labelName.text = "No Model"
-      // Call completion with success to allow camera to start
-      completion?(.success(()))
+    return modelURL
+  }
+
+  private func applyCurrentSettings(
+    to predictor: Predictor,
+    confidenceThreshold: Double? = nil,
+    iouThreshold: Double? = nil,
+    numItemsThreshold: Int? = nil,
+    streamingConfig: YOLOStreamConfig? = nil
+  ) {
+    guard let basePredictor = predictor as? BasePredictor else { return }
+    basePredictor.setConfidenceThreshold(
+      confidence: confidenceThreshold ?? Double(sliderConf.value))
+    basePredictor.setIouThreshold(iou: iouThreshold ?? Double(sliderIoU.value))
+    basePredictor.setNumItemsThreshold(numItems: numItemsThreshold ?? Int(sliderNumItems.value))
+    let effectiveStreamConfig = streamingConfig ?? self.streamConfig
+    basePredictor.capturesOriginalImage = effectiveStreamConfig?.includeOriginalImage == true
+    basePredictor.capturesInstanceMasks = effectiveStreamConfig?.includeMasks == true
+  }
+
+  private func loadPredictor(
+    modelPathOrName: String,
+    task: YOLOTask,
+    useGpu: Bool,
+    completion: @escaping (Result<(Predictor, URL), Error>) -> Void
+  ) {
+    guard let modelURL = resolveModelURL(for: modelPathOrName) else {
+      completion(
+        .failure(
+          NSError(
+            domain: "YOLOView",
+            code: 404,
+            userInfo: [NSLocalizedDescriptionKey: "Model file not found: \(modelPathOrName)"]))
+      )
       return
     }
 
-    modelName = unwrappedModelURL.deletingPathExtension().lastPathComponent
+    let cacheKey = "\(modelURL.path)|\(task)|\(useGpu)"
+    if let cached = predictorCache[cacheKey] {
+      completion(.success((cached, modelURL)))
+      return
+    }
 
-    // Cache key for the loaded predictor — reusing an already-instantiated predictor makes switching back to a model
-    // instant instead of re-compiling/loading CoreML every time.
-    let cacheKey = "\(unwrappedModelURL.path)|\(task)|\(useGpu)"
+    BasePredictor.create(
+      for: task, modelURL: modelURL, isRealTime: true, useGpu: useGpu
+    ) { result in
+      switch result {
+      case .success(let predictor):
+        completion(.success((predictor, modelURL)))
+      case .failure(let error):
+        completion(.failure(error))
+      }
+    }
+  }
+
+  public func setModel(
+    modelPathOrName: String,
+    task: YOLOTask,
+    useGpu: Bool = true,
+    completion: ((Result<Void, Error>) -> Void)? = nil
+  ) {
+    isMultiTaskEnabled = false
+    multiTaskPredictors.removeAll()
+    multiTaskConfigsByKey.removeAll()
+    taskSchedulerStates.removeAll()
+    lastResultsByTask.removeAll()
+    primaryTaskKey = nil
+    activityIndicator.startAnimating()
+    boundingBoxViews.forEach { box in
+      box.hide()
+    }
 
     // Common success handling for all tasks. Keep weak self because model creation can outlive the view during rapid
     // switches or teardown.
-    let handleSuccess: (Predictor) -> Void = { [weak self] predictor in
+    let handleSuccess: (Predictor, URL) -> Void = { [weak self] predictor, modelURL in
       // Always reply, even if the view was deallocated mid-load: `completion` is caller-owned (it doesn't capture
       // self), and a dropped reply permanently stalls the Dart serialized model-switch chain.
       guard let self else {
@@ -374,22 +525,13 @@ public class YOLOView: UIView, VideoCaptureDelegate {
       self.removeClassificationLayers()
       self.setupSublayers()
       self.videoCapture.predictor = predictor
+      self.applyCurrentSettings(to: predictor)
 
-      // Apply the current UI/Dart thresholds and the stream-capture flag to the freshly loaded predictor, mirroring the
-      // cached path below. Without this, a non-cached load (initial load or a setModel switch) would run on the package
-      // defaults until the user next moves a slider — initial Dart thresholds set before the async create completes
-      // would otherwise be lost. The package owns generic capture flags; Flutter-specific filtering stays in this layer.
-      if let basePredictor = predictor as? BasePredictor {
-        basePredictor.setConfidenceThreshold(confidence: Double(sliderConf.value))
-        basePredictor.setIouThreshold(iou: Double(sliderIoU.value))
-        basePredictor.setNumItemsThreshold(numItems: Int(sliderNumItems.value))
-        basePredictor.capturesOriginalImage = self.streamConfig?.includeOriginalImage == true
-        basePredictor.capturesInstanceMasks = self.streamConfig?.includeMasks == true
-      }
-
+      let cacheKey = "\(modelURL.path)|\(task)|\(useGpu)"
       self.cachePredictor(predictor, forKey: cacheKey)
       self.activityIndicator.stopAnimating()
-      self.labelName.text = modelName
+      self.modelName = modelURL.deletingPathExtension().lastPathComponent
+      self.labelName.text = self.modelName
       completion?(.success(()))
     }
 
@@ -405,32 +547,89 @@ public class YOLOView: UIView, VideoCaptureDelegate {
       completion?(.failure(error))
     }
 
-    // Fast path: the predictor is already loaded — reuse it (re-applying the current thresholds) for an instant switch.
-    if let cached = predictorCache[cacheKey] {
-      if let basePredictor = cached as? BasePredictor {
-        basePredictor.setConfidenceThreshold(confidence: Double(sliderConf.value))
-        basePredictor.setIouThreshold(iou: Double(sliderIoU.value))
-        basePredictor.setNumItemsThreshold(numItems: Int(sliderNumItems.value))
-        basePredictor.capturesOriginalImage = self.streamConfig?.includeOriginalImage == true
-        basePredictor.capturesInstanceMasks = self.streamConfig?.includeMasks == true
-      }
-      handleSuccess(cached)
-      return
-    }
-
-    // Use the package default for numItemsThreshold at create time. The live `sliderNumItems` value is applied after
-    // load via setNumItemsThreshold (cached path + sliderChanged); reading it here is unsafe because init() calls
-    // setModel() BEFORE setupUI() configures the slider, so on first load sliderNumItems.value is still 0 (which would
-    // cap detections to zero).
-    BasePredictor.create(
-      for: task, modelURL: unwrappedModelURL, isRealTime: true, useGpu: useGpu
-    ) { result in
+    loadPredictor(modelPathOrName: modelPathOrName, task: task, useGpu: useGpu) { result in
       switch result {
-      case .success(let predictor):
-        handleSuccess(predictor)
+      case .success(let (predictor, modelURL)):
+        handleSuccess(predictor, modelURL)
       case .failure(let error):
         handleFailure(error)
       }
+    }
+  }
+
+  public func setMultiTaskModels(
+    _ configs: [YOLOMultiTaskModelConfig],
+    completion: ((Result<Void, Error>) -> Void)? = nil
+  ) {
+    guard !configs.isEmpty else {
+      completion?(
+        .failure(
+          NSError(
+            domain: "YOLOView",
+            code: 400,
+            userInfo: [NSLocalizedDescriptionKey: "Multi-task config list must not be empty."]))
+      )
+      return
+    }
+
+    activityIndicator.startAnimating()
+    boundingBoxViews.forEach { $0.hide() }
+
+    let group = DispatchGroup()
+    var loaded: [(YOLOMultiTaskModelConfig, Predictor, URL)] = []
+    var firstError: Error?
+
+    for config in configs {
+      group.enter()
+      loadPredictor(modelPathOrName: config.modelPath, task: config.task, useGpu: config.useGpu) {
+        result in
+        switch result {
+        case .success(let (predictor, modelURL)):
+          loaded.append((config, predictor, modelURL))
+        case .failure(let error):
+          if firstError == nil { firstError = error }
+        }
+        group.leave()
+      }
+    }
+
+    group.notify(queue: .main) {
+      if let error = firstError {
+        self.activityIndicator.stopAnimating()
+        completion?(.failure(error))
+        return
+      }
+
+      self.isMultiTaskEnabled = true
+      self.multiTaskPredictors.removeAll()
+      self.multiTaskConfigsByKey.removeAll()
+      self.taskSchedulerStates.removeAll()
+      self.lastResultsByTask.removeAll()
+
+      for (config, predictor, modelURL) in loaded {
+        self.applyCurrentSettings(
+          to: predictor,
+          confidenceThreshold: config.confidenceThreshold,
+          iouThreshold: config.iouThreshold,
+          numItemsThreshold: config.numItemsThreshold,
+          streamingConfig: config.streamingConfig
+        )
+        self.multiTaskPredictors[config.taskKey] = predictor
+        self.multiTaskConfigsByKey[config.taskKey] = config
+        let cacheKey = "\(modelURL.path)|\(config.task)|\(config.useGpu)"
+        self.cachePredictor(predictor, forKey: cacheKey)
+      }
+
+      let primary = loaded[0]
+      self.primaryTaskKey = primary.0.taskKey
+      self.task = primary.0.task
+      self.videoCapture.predictor = primary.1
+      self.modelName = primary.2.deletingPathExtension().lastPathComponent
+      self.labelName.text = self.modelName
+      self.removeClassificationLayers()
+      self.setupSublayers()
+      self.activityIndicator.stopAnimating()
+      completion?(.success(()))
     }
   }
 
@@ -481,6 +680,12 @@ public class YOLOView: UIView, VideoCaptureDelegate {
     videoCapture.delegate = nil
     // Release predictor to prevent memory leak
     videoCapture.predictor = nil
+    multiTaskPredictors.removeAll()
+    multiTaskConfigsByKey.removeAll()
+    taskSchedulerStates.removeAll()
+    lastResultsByTask.removeAll()
+    primaryTaskKey = nil
+    isMultiTaskEnabled = false
   }
 
   /// Pause the camera session, first snapshotting the next frame into `pausedShareImage` so `capturePhoto` can return
@@ -1056,6 +1261,9 @@ public class YOLOView: UIView, VideoCaptureDelegate {
         let numItems = Int(sliderNumItems.value)
         basePredictor.setNumItemsThreshold(numItems: numItems)
       }
+      for predictor in multiTaskPredictors.values {
+        (predictor as? BasePredictor)?.setNumItemsThreshold(numItems: Int(sliderNumItems.value))
+      }
     }
     let conf = Double(round(100 * sliderConf.value)) / 100
     let iou = Double(round(100 * sliderIoU.value)) / 100
@@ -1065,6 +1273,12 @@ public class YOLOView: UIView, VideoCaptureDelegate {
     if let basePredictor = videoCapture.predictor as? BasePredictor {
       basePredictor.setIouThreshold(iou: iou)
       basePredictor.setConfidenceThreshold(confidence: conf)
+    }
+    for predictor in multiTaskPredictors.values {
+      if let basePredictor = predictor as? BasePredictor {
+        basePredictor.setIouThreshold(iou: iou)
+        basePredictor.setConfidenceThreshold(confidence: conf)
+      }
     }
   }
 
@@ -1535,6 +1749,12 @@ public class YOLOView: UIView, VideoCaptureDelegate {
       onZoomChanged = nil
       onLensChanged = nil
       onFocusTapped = nil
+      multiTaskPredictors.removeAll()
+      multiTaskConfigsByKey.removeAll()
+      taskSchedulerStates.removeAll()
+      lastResultsByTask.removeAll()
+      primaryTaskKey = nil
+      isMultiTaskEnabled = false
     }
 
     // Remove notification observers
@@ -1670,6 +1890,12 @@ extension YOLOView {
       config?.includeOriginalImage == true
     (videoCapture.predictor as? BasePredictor)?.capturesInstanceMasks =
       config?.includeMasks == true
+    for predictor in multiTaskPredictors.values {
+      if let basePredictor = predictor as? BasePredictor {
+        basePredictor.capturesOriginalImage = config?.includeOriginalImage == true
+        basePredictor.capturesInstanceMasks = config?.includeMasks == true
+      }
+    }
     setupThrottlingFromConfig()
   }
 
@@ -1719,6 +1945,40 @@ extension YOLOView {
 
     // Initialize timing
     lastInferenceTime = CACurrentMediaTime()
+    lastStreamDispatchTime = CACurrentMediaTime()
+  }
+
+  private func shouldRunInference(for taskKey: String, config: YOLOStreamConfig) -> Bool {
+    var state = taskSchedulerStates[taskKey] ?? TaskSchedulerState()
+    let now = CACurrentMediaTime()
+
+    state.targetSkipFrames = config.skipFrames ?? 0
+    state.inferenceFrameInterval = config.inferenceFrequency.flatMap {
+      $0 > 0 ? 1.0 / Double($0) : nil
+    }
+
+    if state.targetSkipFrames > 0 {
+      state.frameSkipCount += 1
+      if state.frameSkipCount <= state.targetSkipFrames {
+        taskSchedulerStates[taskKey] = state
+        return false
+      }
+      state.frameSkipCount = 0
+      state.lastInferenceTime = now
+      taskSchedulerStates[taskKey] = state
+      return true
+    }
+
+    if let interval = state.inferenceFrameInterval,
+      now - state.lastInferenceTime < interval
+    {
+      taskSchedulerStates[taskKey] = state
+      return false
+    }
+
+    state.lastInferenceTime = now
+    taskSchedulerStates[taskKey] = state
+    return true
   }
 
   /// Check if we should run inference on this frame based on inference frequency control
@@ -1754,14 +2014,14 @@ extension YOLOView {
 
     // Check maxFPS throttling
     if let interval = targetFrameInterval {
-      if now - lastInferenceTime < interval {
+      if now - lastStreamDispatchTime < interval {
         return false
       }
     }
 
     // Check throttleInterval
     if let interval = throttleInterval {
-      if now - lastInferenceTime < interval {
+      if now - lastStreamDispatchTime < interval {
         return false
       }
     }
@@ -1774,11 +2034,18 @@ extension YOLOView {
     lastInferenceTime = CACurrentMediaTime()
   }
 
+  private func updateLastStreamDispatchTime() {
+    lastStreamDispatchTime = CACurrentMediaTime()
+  }
+
   /// Convert YOLOResult to a Dictionary for streaming (ported from Android implementation)
   /// Uses detection index correctly to avoid class index confusion
-  private func convertResultToStreamData(_ result: YOLOResult) -> [String: Any] {
+  private func convertResultToStreamData(
+    _ result: YOLOResult,
+    configOverride: YOLOStreamConfig? = nil
+  ) -> [String: Any] {
     var map: [String: Any] = [:]
-    let config = streamConfig ?? YOLOStreamConfig.DEFAULT
+    let config = configOverride ?? streamConfig ?? YOLOStreamConfig.DEFAULT
 
     // Convert detection results (if enabled)
     if config.includeDetections {

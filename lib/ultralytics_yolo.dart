@@ -2,6 +2,7 @@
 
 export 'core/yolo_model_manager.dart' show DownloadProgress;
 export 'models/yolo_exceptions.dart';
+export 'models/yolo_multi_task.dart';
 export 'models/yolo_result.dart';
 export 'models/yolo_task.dart';
 export 'yolo.dart';

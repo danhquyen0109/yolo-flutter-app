@@ -3,6 +3,7 @@
 import 'package:flutter/services.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:ultralytics_yolo/models/yolo_exceptions.dart';
+import 'package:ultralytics_yolo/models/yolo_multi_task.dart';
 import 'package:ultralytics_yolo/models/yolo_task.dart';
 import 'package:ultralytics_yolo/widgets/yolo_controller.dart';
 import 'utils/test_helpers.dart';
@@ -272,6 +273,45 @@ void main() {
         controller.switchModel('test_model.tflite', YOLOTask.detect),
         throwsA(isA<PlatformException>()),
       );
+    });
+
+    test('setMultiTaskModels resolves entries and calls native method', () async {
+      final setup = YOLOTestHelpers.createYOLOTestSetup(
+        customResponses: {
+          'setMultiTaskModels': (call) {
+            log.add(call);
+            return true;
+          },
+          'inspectModel': (call) {
+            log.add(call);
+            final modelPath = call.arguments['modelPath'] as String;
+            final task = modelPath.contains('seg') ? 'segment' : 'detect';
+            return {
+              'path': modelPath,
+              'task': task,
+              'labels': ['person'],
+            };
+          },
+        },
+      );
+      mockChannel = setup.$1;
+      log = setup.$2;
+      controller.init(mockChannel, 1);
+
+      await controller.setMultiTaskModels(const [
+        YOLOMultiTaskConfig(modelPath: 'det_model.tflite', task: YOLOTask.detect),
+        YOLOMultiTaskConfig(modelPath: 'seg_model.tflite', task: YOLOTask.segment),
+      ]);
+
+      YOLOTestHelpers.assertMethodCalled(log, 'setMultiTaskModels');
+      final call = log.lastWhere(
+        (entry) => entry.method == 'setMultiTaskModels',
+      );
+      final args = call.arguments as Map<dynamic, dynamic>;
+      final tasks = args['tasks'] as List<dynamic>;
+      expect(tasks, hasLength(2));
+      expect(tasks[0]['task'], 'detect');
+      expect(tasks[1]['task'], 'segment');
     });
   });
 }

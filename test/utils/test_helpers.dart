@@ -63,6 +63,8 @@ class YOLOTestHelpers {
               return createMockDetectionResult();
             case 'setModel':
               return true;
+            case 'setMultiTaskModels':
+              return true;
             case 'setThresholds':
               return true;
             case 'setConfidenceThreshold':
